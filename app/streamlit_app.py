@@ -21,6 +21,10 @@ from tokenpay.exchange import ExchangeEngine
 from tokenpay.wallet import WalletEngine
 from tokenpay.ledger import Ledger
 from tokenpay.payment import PaymentEngine
+from tokenpay.marketplace import (
+    Marketplace, ListingCategory, ListingStatus, OrderStatus,
+    SAMPLE_LISTINGS,
+)
 
 
 st.set_page_config(
@@ -61,6 +65,20 @@ if "account" not in st.session_state:
 if "accounts" not in st.session_state:
     st.session_state.accounts = {"alice": st.session_state.wallet.create_account("Alice"),
                                   "bob": st.session_state.wallet.create_account("Bob")}
+if "marketplace" not in st.session_state:
+    mp = Marketplace()
+    # Seed sample listings
+    for sl in SAMPLE_LISTINGS:
+        mp.create_listing(
+            seller_id=st.session_state.accounts["alice"].id,
+            seller_name="Alice",
+            title=sl["title"],
+            description=sl["description"],
+            price_flx=sl["price_flx"],
+            category=sl["category"],
+            tags=sl["tags"],
+        )
+    st.session_state.marketplace = mp
 
 exchange = st.session_state.exchange
 wallet = st.session_state.wallet
@@ -74,7 +92,7 @@ with st.sidebar:
     st.markdown("## 💳 TokenPay")
     st.caption("AI Settlement Layer")
 
-    page = st.radio("Navigate", ["🏦 Wallet", "💱 Exchange", "💸 Transfer", "📒 Ledger"],
+    page = st.radio("Navigate", ["🏦 Wallet", "💱 Exchange", "💸 Transfer", "🛒 Market", "📒 Ledger"],
                     label_visibility="collapsed")
 
     st.divider()
@@ -285,7 +303,146 @@ elif page == "💸 Transfer":
 
 
 # ============================================================
-# PAGE 4: LEDGER
+# PAGE 4: MARKETPLACE
+# ============================================================
+elif page == "🛒 Market":
+    st.markdown('<p class="tp-title">🛒 Marketplace</p>', unsafe_allow_html=True)
+    st.markdown('<p class="tp-subtitle">Real goods & services. Priced in FLX. Escrow-protected.</p>',
+                unsafe_allow_html=True)
+
+    mp = st.session_state.marketplace
+    account = st.session_state.account
+
+    # Stats
+    stats = mp.get_stats()
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Active Listings", stats["active_listings"])
+    with c2:
+        st.metric("Orders", stats["total_orders"])
+    with c3:
+        st.metric("Completed", stats["completed_orders"])
+    with c4:
+        st.metric("Volume", f"{stats['total_volume_flx']:.1f} FLX")
+
+    tab1, tab2, tab3 = st.tabs(["🛍️ Browse", "📋 My Orders", "📝 Create Listing"])
+
+    with tab1:
+        category_filter = st.selectbox("Category", ["All"] + [c.value for c in ListingCategory])
+        cat = None if category_filter == "All" else ListingCategory(category_filter)
+
+        listings = mp.get_active_listings(category=cat)
+
+        if listings:
+            for listing in listings:
+                seller = mp.get_seller_profile(listing.seller_id)
+                rating = f"⭐{seller.avg_rating:.1f}" if seller and seller.avg_rating > 0 else "New"
+
+                with st.container():
+                    col1, col2, col3 = st.columns([3, 1, 1])
+                    with col1:
+                        st.markdown(f"**{listing.title}**")
+                        st.caption(f"{listing.description[:120]}... · {listing.category.value} · {rating}")
+                        if listing.tags:
+                            st.caption(" · ".join(f"`{t}`" for t in listing.tags))
+                    with col2:
+                        st.markdown(f"<span class='flx-badge' style='font-size:1.1rem;'>{listing.price_flx} FLX</span>", unsafe_allow_html=True)
+                        st.caption(f"≈ ${listing.price_flx * exchange.rate.usd_per_flx:.2f} USD")
+                    with col3:
+                        if st.button(f"🛒 Buy", key=f"buy_{listing.id}"):
+                            try:
+                                result = mp.place_order(
+                                    listing.id, account.id, account.name or "Me",
+                                    payment, note=""
+                                )
+                                # Create escrow in payment engine
+                                seller_acct = wallet.get_account(listing.seller_id)
+                                if seller_acct and account.flx_balance.available_flx >= listing.price_flx:
+                                    escrow_tx = payment.escrow_transfer(
+                                        account, seller_acct, listing.price_flx,
+                                        condition=f"Order for: {listing.title}"
+                                    )
+                                    result["order"].escrow_tx_id = escrow_tx.id
+                                    ledger.record(escrow_tx)
+                                    st.success(f"✅ Order placed! {listing.price_flx} FLX in escrow.")
+                                    st.rerun()
+                                else:
+                                    st.error(f"Insufficient FLX. Available: {account.flx_balance.available_flx:.4f}")
+                            except Exception as e:
+                                st.error(str(e))
+                    st.divider()
+        else:
+            st.info("No active listings in this category.")
+
+    with tab2:
+        orders = mp.get_orders_for_user(account.id)
+        if orders:
+            for order in reversed(orders):
+                with st.container():
+                    status_color = {
+                        OrderStatus.PENDING_ESCROW: "🟡", OrderStatus.DELIVERED: "🟢",
+                        OrderStatus.COMPLETED: "✅", OrderStatus.DISPUTED: "🔴",
+                        OrderStatus.CANCELLED: "⚫", OrderStatus.REFUNDED: "↩️",
+                    }
+                    emoji = status_color.get(order.status, "❓")
+
+                    st.markdown(f"{emoji} **{order.listing_title}** — {order.amount_flx} FLX")
+                    st.caption(f"{order.status.value} · Seller: {order.seller_name} · Buyer: {order.buyer_name}")
+
+                    col_a, col_b = st.columns(2)
+                    if order.status == OrderStatus.DELIVERED and order.buyer_id == account.id:
+                        with col_a:
+                            if order.delivery_note:
+                                st.caption(f"📝 Seller note: {order.delivery_note}")
+                        with col_b:
+                            rating = st.selectbox("Rating", [5,4,3,2,1], key=f"rate_{order.id}")
+                            if st.button(f"✅ Confirm Receipt", key=f"confirm_{order.id}"):
+                                result = mp.confirm_receipt(order.id, payment, rating)
+                                # Release escrow
+                                # (in production: find escrow tx and release it)
+                                st.success(f"🎉 Order complete! {order.amount_flx} FLX released to {order.seller_name}.")
+                                st.balloons()
+                                st.rerun()
+
+                    elif order.status == OrderStatus.PENDING_ESCROW and order.seller_id == account.id:
+                        delivery_note = st.text_input("Delivery note", key=f"delnote_{order.id}",
+                                                       placeholder="Work delivered! Here's the link...")
+                        if st.button(f"📤 Mark Delivered", key=f"deliver_{order.id}"):
+                            mp.mark_delivered(order.id, delivery_note)
+                            st.success("Marked as delivered. Waiting for buyer confirmation.")
+                            st.rerun()
+
+                    st.divider()
+        else:
+            st.info("No orders yet. Go browse the marketplace!")
+
+    with tab3:
+        st.markdown("### Sell something for FLX")
+        col1, col2 = st.columns(2)
+        with col1:
+            new_title = st.text_input("Title", placeholder="e.g., Design a logo")
+            new_cat = st.selectbox("Category", [c for c in ListingCategory], format_func=lambda c: c.value)
+        with col2:
+            new_price = st.number_input("Price (FLX)", min_value=0.1, value=3.0, step=0.5)
+            new_tags = st.text_input("Tags (comma-separated)", placeholder="design, logo, fast")
+
+        new_desc = st.text_area("Description", placeholder="Describe what you're offering...", height=100)
+
+        if st.button("📝 Create Listing", type="primary"):
+            if new_title and new_price > 0:
+                tags = [t.strip() for t in new_tags.split(",") if t.strip()]
+                listing = mp.create_listing(
+                    account.id, account.name or "Anonymous",
+                    new_title, new_desc, new_price, new_cat, tags,
+                )
+                st.success(f"✅ Listed! '{new_title}' for {new_price} FLX.")
+                st.rerun()
+            else:
+                st.warning("Title and price are required.")
+
+
+# ============================================================
+# PAGE 5: LEDGER
 # ============================================================
 elif page == "📒 Ledger":
     st.markdown('<p class="tp-title">📒 Ledger</p>', unsafe_allow_html=True)
